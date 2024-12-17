@@ -86,6 +86,8 @@ class ChatAppGenerator(MessageBasedAppGenerator):
         query = query.replace("\x00", "")
         inputs = args["inputs"]
 
+        parent_message_id =  args.get("parent_message_id")
+
         extras = {"auto_generate_conversation_name": args.get("auto_generate_name", True)}
 
         # get conversation
@@ -147,7 +149,7 @@ class ChatAppGenerator(MessageBasedAppGenerator):
             ),
             query=query,
             files=file_objs,
-            parent_message_id=args.get("parent_message_id") if invoke_from != InvokeFrom.SERVICE_API else UUID_NIL,
+            parent_message_id=parent_message_id,
             user_id=user.id,
             invoke_from=invoke_from,
             extras=extras,
