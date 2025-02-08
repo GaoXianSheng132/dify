@@ -32,6 +32,7 @@ from models.account import (
     TenantStatus,
 )
 from models.model import DifySetup
+from services.billing_service import BillingService
 from services.errors.account import (
     AccountAlreadyInTenantError,
     AccountLoginError,
@@ -50,6 +51,8 @@ from services.errors.account import (
 )
 from services.errors.workspace import WorkSpaceNotAllowedCreateError
 from services.feature_service import FeatureService
+from tasks.delete_account_task import delete_account_task
+from tasks.mail_account_deletion_task import send_account_deletion_verification_code
 from tasks.mail_email_code_login import send_email_code_login_mail_task
 from tasks.mail_invite_member_task import send_invite_member_mail_task
 from tasks.mail_reset_password_task import send_reset_password_mail_task
@@ -62,7 +65,7 @@ class TokenPair(BaseModel):
 
 REFRESH_TOKEN_PREFIX = "refresh_token:"
 ACCOUNT_REFRESH_TOKEN_PREFIX = "account_refresh_token:"
-REFRESH_TOKEN_EXPIRY = timedelta(days=30)
+REFRESH_TOKEN_EXPIRY = timedelta(days=dify_config.REFRESH_TOKEN_EXPIRE_DAYS)
 
 
 class AccountService:
@@ -70,7 +73,11 @@ class AccountService:
     email_code_login_rate_limiter = RateLimiter(
         prefix="email_code_login_rate_limit", max_attempts=1, time_window=60 * 1
     )
+    email_code_account_deletion_rate_limiter = RateLimiter(
+        prefix="email_code_account_deletion_rate_limit", max_attempts=1, time_window=60 * 1
+    )
     LOGIN_MAX_ERROR_LIMITS = 5
+    FORGOT_PASSWORD_MAX_ERROR_LIMITS = 5
 
     @staticmethod
     def _get_refresh_token_key(refresh_token: str) -> str:
@@ -201,6 +208,15 @@ class AccountService:
             from controllers.console.error import AccountNotFound
 
             raise AccountNotFound()
+
+        if dify_config.BILLING_ENABLED and BillingService.is_email_in_freeze(email):
+            raise AccountRegisterError(
+                description=(
+                    "This email account has been deleted within the past "
+                    "30 days and is temporarily unavailable for new account registration"
+                )
+            )
+
         account = Account()
         account.email = email
         account.name = name
@@ -239,6 +255,42 @@ class AccountService:
         TenantService.create_owner_tenant_if_not_exist(account=account)
 
         return account
+
+    @staticmethod
+    def generate_account_deletion_verification_code(account: Account) -> tuple[str, str]:
+        code = "".join([str(random.randint(0, 9)) for _ in range(6)])
+        token = TokenManager.generate_token(
+            account=account, token_type="account_deletion", additional_data={"code": code}
+        )
+        return token, code
+
+    @classmethod
+    def send_account_deletion_verification_email(cls, account: Account, code: str):
+        email = account.email
+        if cls.email_code_account_deletion_rate_limiter.is_rate_limited(email):
+            from controllers.console.auth.error import EmailCodeAccountDeletionRateLimitExceededError
+
+            raise EmailCodeAccountDeletionRateLimitExceededError()
+
+        send_account_deletion_verification_code.delay(to=email, code=code)
+
+        cls.email_code_account_deletion_rate_limiter.increment_rate_limit(email)
+
+    @staticmethod
+    def verify_account_deletion_code(token: str, code: str) -> bool:
+        token_data = TokenManager.get_token_data(token, "account_deletion")
+        if token_data is None:
+            return False
+
+        if token_data["code"] != code:
+            return False
+
+        return True
+
+    @staticmethod
+    def delete_account(account: Account) -> None:
+        """Delete account. This method only adds a task to the queue for deletion."""
+        delete_account_task.delay(account.id)
 
     @staticmethod
     def link_account_integrate(provider: str, open_id: str, account: Account) -> None:
@@ -379,6 +431,7 @@ class AccountService:
     def send_email_code_login_email(
         cls, account: Optional[Account] = None, email: Optional[str] = None, language: Optional[str] = "en-US"
     ):
+        email = account.email if account else email
         if email is None:
             raise ValueError("Email must be provided.")
         if cls.email_code_login_rate_limiter.is_rate_limited(email):
@@ -408,6 +461,14 @@ class AccountService:
 
     @classmethod
     def get_user_through_email(cls, email: str):
+        if dify_config.BILLING_ENABLED and BillingService.is_email_in_freeze(email):
+            raise AccountRegisterError(
+                description=(
+                    "This email account has been deleted within the past "
+                    "30 days and is temporarily unavailable for new account registration"
+                )
+            )
+
         account = db.session.query(Account).filter(Account.email == email).first()
         if not account:
             return None
@@ -441,6 +502,32 @@ class AccountService:
     @staticmethod
     def reset_login_error_rate_limit(email: str):
         key = f"login_error_rate_limit:{email}"
+        redis_client.delete(key)
+
+    @staticmethod
+    def add_forgot_password_error_rate_limit(email: str) -> None:
+        key = f"forgot_password_error_rate_limit:{email}"
+        count = redis_client.get(key)
+        if count is None:
+            count = 0
+        count = int(count) + 1
+        redis_client.setex(key, dify_config.FORGOT_PASSWORD_LOCKOUT_DURATION, count)
+
+    @staticmethod
+    def is_forgot_password_error_rate_limit(email: str) -> bool:
+        key = f"forgot_password_error_rate_limit:{email}"
+        count = redis_client.get(key)
+        if count is None:
+            return False
+
+        count = int(count)
+        if count > AccountService.FORGOT_PASSWORD_MAX_ERROR_LIMITS:
+            return True
+        return False
+
+    @staticmethod
+    def reset_forgot_password_error_rate_limit(email: str):
+        key = f"forgot_password_error_rate_limit:{email}"
         redis_client.delete(key)
 
     @staticmethod
@@ -824,6 +911,10 @@ class RegisterService:
             db.session.commit()
         except WorkSpaceNotAllowedCreateError:
             db.session.rollback()
+        except AccountRegisterError as are:
+            db.session.rollback()
+            logging.exception("Register failed")
+            raise are
         except Exception as e:
             db.session.rollback()
             logging.exception("Register failed")
