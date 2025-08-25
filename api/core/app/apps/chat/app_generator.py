@@ -156,7 +156,7 @@ class ChatAppGenerator(MessageBasedAppGenerator):
             ),
             query=query,
             files=list(file_objs),
-            parent_message_id=args.get("parent_message_id") if invoke_from != InvokeFrom.SERVICE_API else UUID_NIL,
+            parent_message_id=args.get("parent_message_id"),
             user_id=user.id,
             invoke_from=invoke_from,
             extras=extras,
