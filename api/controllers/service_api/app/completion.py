@@ -54,6 +54,7 @@ completion_parser.add_argument(
 chat_parser = reqparse.RequestParser()
 chat_parser.add_argument("inputs", type=dict, required=True, location="json", help="Input parameters for chat")
 chat_parser.add_argument("query", type=str, required=True, location="json", help="The chat query")
+chat_parser.add_argument("parent_message_id", type=uuid_value, required=False, location="json", help="parent ID")
 chat_parser.add_argument("files", type=list, required=False, location="json", help="List of file attachments")
 chat_parser.add_argument(
     "response_mode", type=str, choices=["blocking", "streaming"], location="json", help="Response mode"
